@@ -181,15 +181,17 @@ func readNativeFrames(d dicomio.Reader, parsedData *Dataset, fc chan<- *frame.Fr
 	}
 
 	// Parse information from previously parsed attributes that are needed to parse NativeData Frames:
-	rows, err := parsedData.FindElementByTag(tag.Rows)
+	r, err := parsedData.FindElementByTag(tag.Rows)
 	if err != nil {
 		return nil, 0, err
 	}
+	rows := MustGetInts(r.Value)[0]
 
-	cols, err := parsedData.FindElementByTag(tag.Columns)
+	c, err := parsedData.FindElementByTag(tag.Columns)
 	if err != nil {
 		return nil, 0, err
 	}
+	cols := MustGetInts(c.Value)[0]
 
 	nof, err := parsedData.FindElementByTag(tag.NumberOfFrames)
 	nFrames := 0
@@ -216,7 +218,7 @@ func readNativeFrames(d dicomio.Reader, parsedData *Dataset, fc chan<- *frame.Fr
 	}
 	samplesPerPixel := MustGetInts(s.Value)[0]
 
-	pixelsPerFrame := MustGetInts(rows.Value)[0] * MustGetInts(cols.Value)[0]
+	pixelsPerFrame := rows * cols
 
 	// Parse the pixels:
 	image.Frames = make([]frame.Frame, nFrames)
@@ -225,14 +227,10 @@ func readNativeFrames(d dicomio.Reader, parsedData *Dataset, fc chan<- *frame.Fr
 	pixelBuf := make([]byte, bytesAllocated)
 	for frameIdx := 0; frameIdx < nFrames; frameIdx++ {
 		// Init current frame
+		nativeFrame := frame.NewNativeFrame(bitsAllocated, rows, cols)
 		currentFrame := frame.Frame{
 			Encapsulated: false,
-			NativeData: frame.NativeFrame{
-				BitsPerSample: bitsAllocated,
-				Rows:          MustGetInts(rows.Value)[0],
-				Cols:          MustGetInts(cols.Value)[0],
-				Data:          make([][]int, int(pixelsPerFrame)),
-			},
+			NativeData:   *nativeFrame,
 		}
 		buf := make([]int, int(pixelsPerFrame)*samplesPerPixel)
 		for pixel := 0; pixel < int(pixelsPerFrame); pixel++ {
@@ -251,7 +249,7 @@ func readNativeFrames(d dicomio.Reader, parsedData *Dataset, fc chan<- *frame.Fr
 					buf[(pixel*samplesPerPixel)+value] = int(bo.Uint32(pixelBuf))
 				}
 			}
-			currentFrame.NativeData.Data[pixel] = buf[pixel*samplesPerPixel : (pixel+1)*samplesPerPixel]
+			currentFrame.NativeData.SetPixel(pixel, buf[pixel*samplesPerPixel:(pixel+1)*samplesPerPixel])
 		}
 		image.Frames[frameIdx] = currentFrame
 		if fc != nil {
@@ -368,7 +366,7 @@ func readBytes(r dicomio.Reader, t tag.Tag, vr string, vl uint32) (Value, error)
 		if vl%2 != 0 {
 			return nil, ErrorOWRequiresEvenVL
 		}
-		
+
 		buf := bytes.NewBuffer(make([]byte, 0, vl))
 		numWords := int(vl / 2)
 		for i := 0; i < numWords; i++ {
