@@ -97,6 +97,11 @@ func readVL(r dicomio.Reader, isImplicit bool, t tag.Tag, vr string) (uint32, er
 }
 
 func readValue(r dicomio.Reader, t tag.Tag, vr string, vl uint32, isImplicit bool, d *Dataset, fc chan<- *frame.Frame) (Value, error) {
+	// https://github.com/suyashkumar/dicom/issues/220
+	if vr == tag.UnknownVR && vl == tag.VLUndefinedLength {
+		return readSequence(r, t, vr, vl)
+	}
+
 	vrkind := tag.GetVRKind(t, vr)
 	// TODO: if we keep consistent function signature, consider a static map of VR to func?
 	switch vrkind {
