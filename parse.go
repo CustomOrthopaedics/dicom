@@ -25,10 +25,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"log"
 	"os"
 
 	"github.com/suyashkumar/dicom/pkg/charset"
+	"github.com/suyashkumar/dicom/pkg/debug"
 	"github.com/suyashkumar/dicom/pkg/dicomio"
 	"github.com/suyashkumar/dicom/pkg/frame"
 	"github.com/suyashkumar/dicom/pkg/tag"
@@ -108,7 +108,8 @@ type Parser struct {
 //
 // frameChannel is an optional channel (can be nil) upon which DICOM image frames will be sent as they are parsed (if
 // provided).
-func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame) (*Parser, error) {
+func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame, opts ...ParseOption) (*Parser, error) {
+	optSet := toParseOptSet(opts...)
 	reader, err := dicomio.NewReader(bufio.NewReader(in), binary.LittleEndian, bytesToRead)
 	if err != nil {
 		return nil, err
@@ -119,9 +120,15 @@ func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame) 
 		frameChannel: frameChannel,
 	}
 
-	elems, err := p.readHeader()
-	if err != nil {
-		return nil, err
+	elems := []*Element{}
+
+	if !optSet.skipMetadataReadOnNewParserInit {
+		debug.Log("NewParser: readHeader")
+		elems, err = p.readHeader()
+		if err != nil {
+			return nil, err
+		}
+		debug.Log("NewParser: readHeader complete")
 	}
 
 	p.dataset = Dataset{Elements: elems}
@@ -135,13 +142,13 @@ func NewParser(in io.Reader, bytesToRead int64, frameChannel chan *frame.Frame) 
 
 	ts, err := p.dataset.FindElementByTag(tag.TransferSyntaxUID)
 	if err != nil {
-		log.Println("WARN: could not find transfer syntax uid in metadata, proceeding with little endian implicit")
+		debug.Log("WARN: could not find transfer syntax uid in metadata, proceeding with little endian implicit")
 	} else {
 		bo, implicit, err = uid.ParseTransferSyntaxUID(MustGetStrings(ts.Value)[0])
 		if err != nil {
 			// TODO(suyashkumar): should we attempt to parse with LittleEndian
 			// Implicit here?
-			log.Println("WARN: could not parse transfer syntax uid in metadata")
+			debug.Log("WARN: could not parse transfer syntax uid in metadata")
 		}
 	}
 	p.reader.SetTransferSyntax(bo, implicit)
@@ -186,6 +193,11 @@ func (p *Parser) Next() (*Element, error) {
 // so far.
 func (p *Parser) GetMetadata() Dataset {
 	return p.metadata
+}
+
+// SetTransferSyntax sets the transfer syntax for the underlying dicomio.Reader.
+func (p *Parser) SetTransferSyntax(bo binary.ByteOrder, implicit bool) {
+	p.reader.SetTransferSyntax(bo, implicit)
 }
 
 // readHeader reads the DICOM magic header and group two metadata elements.
@@ -238,4 +250,28 @@ func (p *Parser) readHeader() ([]*Element, error) {
 		metaElems = append(metaElems, elem)
 	}
 	return metaElems, nil
+}
+
+// ParseOption represents an option that can be passed to NewParser.
+type ParseOption func(*parseOptSet)
+
+// parseOptSet represents the flattened option set after all ParseOptions have been applied.
+type parseOptSet struct {
+	skipMetadataReadOnNewParserInit bool
+}
+
+func toParseOptSet(opts ...ParseOption) *parseOptSet {
+	optSet := &parseOptSet{}
+	for _, opt := range opts {
+		opt(optSet)
+	}
+	return optSet
+}
+
+// SkipMetadataReadOnNewParserInit makes NewParser skip trying to parse metadata. This will make the Parser default to implicit little endian byte order.
+// Any metatata tags found in the dataset will still be available when parsing.
+func SkipMetadataReadOnNewParserInit() ParseOption {
+	return func(set *parseOptSet) {
+		set.skipMetadataReadOnNewParserInit = true
+	}
 }

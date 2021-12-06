@@ -7,6 +7,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/suyashkumar/dicom/pkg/vrraw"
+
 	"github.com/suyashkumar/dicom/pkg/frame"
 
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -45,6 +47,18 @@ func TestWrite(t *testing.T) {
 				mustNewElement(tag.FloatingPointValue, []float64{128.10}),
 				mustNewElement(tag.DimensionIndexPointer, []int{32, 36950}),
 				mustNewElement(tag.RedPaletteColorLookupTableData, []byte{0x1, 0x2, 0x3, 0x4}),
+			}},
+			expectedError: nil,
+		},
+		{
+			name: "private tag",
+			dataset: Dataset{Elements: []*Element{
+				mustNewElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
+				mustNewElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.3.4.5.6.7"}),
+				// We need to use an Explicit transfer syntax here or all data will be
+				// read in with "UN".
+				mustNewElement(tag.TransferSyntaxUID, []string{uid.ExplicitVRLittleEndian}),
+				mustNewPrivateElement(tag.Tag{0x0003, 0x0010}, vrraw.ShortText, []string{"some data"}),
 			}},
 			expectedError: nil,
 		},
@@ -473,6 +487,7 @@ func TestVerifyVR(t *testing.T) {
 		inVR    string
 		wantVR  string
 		wantErr bool
+		opts    writeOptSet
 	}{
 		{
 			name:    "wrong vr",
@@ -498,10 +513,30 @@ func TestVerifyVR(t *testing.T) {
 			wantVR:  "UN",
 			wantErr: false,
 		},
+		{
+			name: "private element",
+			tg: tag.Tag{
+				Group:   0x0003,
+				Element: 0x0010,
+			},
+			inVR:    "DA",
+			wantVR:  "DA",
+			wantErr: false,
+		},
+		{
+			name:    "skip validation - wrong vr",
+			tg:      tag.PatientName,
+			inVR:    "DS",
+			wantVR:  "DS",
+			wantErr: false,
+			opts: writeOptSet{
+				skipVRVerification: true,
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			vr, err := verifyVROrDefault(tc.tg, tc.inVR, writeOptSet{})
+			vr, err := verifyVROrDefault(tc.tg, tc.inVR, tc.opts)
 			if (err != nil && !tc.wantErr) || (err == nil && tc.wantErr) {
 				t.Errorf("verifyVROrDefault(%v, %v), got err: %v but want err: %v", tc.tg, tc.inVR, err, tc.wantErr)
 			}
@@ -598,16 +633,16 @@ func TestWriteOtherWord(t *testing.T) {
 		expectedErr  error
 	}{
 		{
-			name:  "OtherWord",
-			value: []byte{0x1, 0x2, 0x3, 0x4},
-			vr:    "OW",
+			name:         "OtherWord",
+			value:        []byte{0x1, 0x2, 0x3, 0x4},
+			vr:           "OW",
 			expectedData: []byte{0x1, 0x2, 0x3, 0x4},
 			expectedErr:  nil,
 		},
 		{
-			name:  "OtherBytes",
-			value: []byte{0x1, 0x2, 0x3, 0x4},
-			vr:    "OB",
+			name:         "OtherBytes",
+			value:        []byte{0x1, 0x2, 0x3, 0x4},
+			vr:           "OB",
 			expectedData: []byte{0x1, 0x2, 0x3, 0x4},
 			expectedErr:  nil,
 		},
@@ -632,4 +667,45 @@ func TestWriteOtherWord(t *testing.T) {
 func setUndefinedLength(e *Element) *Element {
 	e.ValueLength = tag.VLUndefinedLength
 	return e
+}
+
+// TestWriteElement tests a dataset written using writer.WriteElement can be parsed into an identical dataset using NewParser.
+func TestWriteElement(t *testing.T) {
+	writeDS := Dataset{Elements: []*Element{
+		mustNewElement(tag.MediaStorageSOPClassUID, []string{"1.2.840.10008.5.1.4.1.1.1.2"}),
+		mustNewElement(tag.MediaStorageSOPInstanceUID, []string{"1.2.3.4.5.6.7"}),
+		mustNewElement(tag.TransferSyntaxUID, []string{uid.ImplicitVRLittleEndian}),
+		mustNewElement(tag.PatientName, []string{"Bob", "Jones"}),
+		mustNewElement(tag.Rows, []int{128}),
+		mustNewElement(tag.FloatingPointValue, []float64{128.10}),
+		mustNewElement(tag.DimensionIndexPointer, []int{32, 36950}),
+		mustNewElement(tag.RedPaletteColorLookupTableData, []byte{0x1, 0x2, 0x3, 0x4}),
+	}}
+
+	buf := bytes.Buffer{}
+	w := NewWriter(&buf)
+	w.SetTransferSyntax(binary.LittleEndian, true)
+
+	for _, e := range writeDS.Elements {
+		err := w.WriteElement(e)
+		if err != nil {
+			t.Errorf("error in writing element %s: %s", e.String(), err.Error())
+		}
+	}
+
+	p, err := NewParser(&buf, int64(buf.Len()), nil, SkipMetadataReadOnNewParserInit())
+	if err != nil {
+		t.Fatalf("failed to create parser: %v", err)
+	}
+
+	for _, writtenElem := range writeDS.Elements {
+		readElem, err := p.Next()
+		if err != nil {
+			t.Errorf("error in reading element %s: %s", readElem.String(), err.Error())
+		}
+
+		if diff := cmp.Diff(writtenElem, readElem, cmp.AllowUnexported(allValues...), cmpopts.IgnoreFields(Element{}, "ValueLength")); diff != "" {
+			t.Errorf("unexpected diff in element: %s", diff)
+		}
+	}
 }

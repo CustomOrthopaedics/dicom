@@ -11,6 +11,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/suyashkumar/dicom/pkg/debug"
 	"github.com/suyashkumar/dicom/pkg/vrraw"
 
 	"github.com/suyashkumar/dicom/pkg/dicomio"
@@ -23,8 +24,12 @@ var (
 	// value length which is not allowed.
 	ErrorOWRequiresEvenVL = errors.New("vr of OW requires even value length")
 	// ErrorUnsupportedVR indicates that this VR is not supported.
-	ErrorUnsupportedVR      = errors.New("unsupported VR")
-	errorUnableToParseFloat = errors.New("unable to parse float type")
+	ErrorUnsupportedVR = errors.New("unsupported VR")
+	// ErrorUnsupportedBitsAllocated indicates that the BitsAllocated in the
+	// NativeFrame PixelData is unsupported. In this situation, the rest of the
+	// dataset returned is still valid.
+	ErrorUnsupportedBitsAllocated = errors.New("unsupported BitsAllocated")
+	errorUnableToParseFloat       = errors.New("unable to parse float type")
 )
 
 func readTag(r dicomio.Reader) (*tag.Tag, error) {
@@ -92,6 +97,11 @@ func readVL(r dicomio.Reader, isImplicit bool, t tag.Tag, vr string) (uint32, er
 }
 
 func readValue(r dicomio.Reader, t tag.Tag, vr string, vl uint32, isImplicit bool, d *Dataset, fc chan<- *frame.Frame) (Value, error) {
+	// https://github.com/suyashkumar/dicom/issues/220
+	if vr == tag.UnknownVR && vl == tag.VLUndefinedLength {
+		return readSequence(r, t, vr, vl)
+	}
+
 	vrkind := tag.GetVRKind(t, vr)
 	// TODO: if we keep consistent function signature, consider a static map of VR to func?
 	switch vrkind {
@@ -172,6 +182,49 @@ func readPixelData(r dicomio.Reader, t tag.Tag, vr string, vl uint32, d *Dataset
 
 }
 
+func getNthBit(data byte, n int) int {
+	debug.Logf("mask: %0b", 1<<n)
+	if (1 << n & uint8(data)) > 0 {
+		return 1
+	}
+	return 0
+}
+
+func fillBufferSingleBitAllocated(pixelData []int, d dicomio.Reader, bo binary.ByteOrder) error {
+	debug.Logf("len of pixeldata: %d", len(pixelData))
+	if len(pixelData)%8 > 0 {
+		return errors.New("when bitsAllocated is 1, we can't read a number of samples that is not a multiple of 8")
+	}
+
+	var currentByte byte
+	for i := 0; i < len(pixelData)/8; i++ {
+		rawData := make([]byte, 1)
+		_, err := d.Read(rawData)
+		if err != nil {
+			return err
+		}
+		currentByte = rawData[0]
+		debug.Logf("currentByte: %0b", currentByte)
+
+		// Read in the 8 bits from the current byte.
+		// Always treat the data as LittleEndian encoded.
+		// This is what pydicom appears to do, and I can't get Go to properly
+		// write out bytes literals in BigEndian, even using binary.Write
+		// (in order to test what BigEndian might look like). We should consider
+		// revisiting this more closely, and see if the most significant bit tag
+		// should be used to determine the read order here.
+		idx := 0
+		for j := 7; j >= 0; j-- {
+			pixelData[(8*i)+idx] = getNthBit(currentByte, j)
+			debug.Logf("getbit #%d: %d", j, getNthBit(currentByte, j))
+			idx++
+		}
+
+	}
+
+	return nil
+}
+
 // readNativeFrames reads NativeData frames from a Decoder based on already parsed pixel information
 // that should be available in parsedData (elements like NumberOfFrames, rows, columns, etc)
 func readNativeFrames(d dicomio.Reader, parsedData *Dataset, fc chan<- *frame.Frame) (pixelData *PixelDataInfo,
@@ -218,6 +271,8 @@ func readNativeFrames(d dicomio.Reader, parsedData *Dataset, fc chan<- *frame.Fr
 
 	pixelsPerFrame := MustGetInts(rows.Value)[0] * MustGetInts(cols.Value)[0]
 
+	debug.Logf("readNativeFrames:\nRows: %d\nCols:%d\nFrames::%d\nBitsAlloc:%d\nSamplesPerPixel:%d", MustGetInts(rows.Value)[0], MustGetInts(cols.Value)[0], nFrames, bitsAllocated, samplesPerPixel)
+
 	// Parse the pixels:
 	image.Frames = make([]frame.Frame, nFrames)
 	bo := d.ByteOrder()
@@ -235,23 +290,36 @@ func readNativeFrames(d dicomio.Reader, parsedData *Dataset, fc chan<- *frame.Fr
 			},
 		}
 		buf := make([]int, int(pixelsPerFrame)*samplesPerPixel)
-		for pixel := 0; pixel < int(pixelsPerFrame); pixel++ {
-			for value := 0; value < samplesPerPixel; value++ {
-				_, err := io.ReadFull(d, pixelBuf)
-				if err != nil {
-					return nil, bytesRead,
-						fmt.Errorf("could not read uint%d from input: %w", bitsAllocated, err)
-				}
-
-				if bitsAllocated == 8 {
-					buf[(pixel*samplesPerPixel)+value] = int(pixelBuf[0])
-				} else if bitsAllocated == 16 {
-					buf[(pixel*samplesPerPixel)+value] = int(bo.Uint16(pixelBuf))
-				} else if bitsAllocated == 32 {
-					buf[(pixel*samplesPerPixel)+value] = int(bo.Uint32(pixelBuf))
+		if bitsAllocated == 1 {
+			if err := fillBufferSingleBitAllocated(buf, d, bo); err != nil {
+				return nil, bytesRead, err
+			}
+			for pixel := 0; pixel < int(pixelsPerFrame); pixel++ {
+				for value := 0; value < samplesPerPixel; value++ {
+					currentFrame.NativeData.Data[pixel] = buf[pixel*samplesPerPixel : (pixel+1)*samplesPerPixel]
 				}
 			}
-			currentFrame.NativeData.Data[pixel] = buf[pixel*samplesPerPixel : (pixel+1)*samplesPerPixel]
+		} else {
+			for pixel := 0; pixel < int(pixelsPerFrame); pixel++ {
+				for value := 0; value < samplesPerPixel; value++ {
+					_, err := io.ReadFull(d, pixelBuf)
+					if err != nil {
+						return nil, bytesRead,
+							fmt.Errorf("could not read uint%d from input: %w", bitsAllocated, err)
+					}
+
+					if bitsAllocated == 8 {
+						buf[(pixel*samplesPerPixel)+value] = int(pixelBuf[0])
+					} else if bitsAllocated == 16 {
+						buf[(pixel*samplesPerPixel)+value] = int(bo.Uint16(pixelBuf))
+					} else if bitsAllocated == 32 {
+						buf[(pixel*samplesPerPixel)+value] = int(bo.Uint32(pixelBuf))
+					} else {
+						return nil, bytesRead, fmt.Errorf("unsupported BitsAllocated value of: %d : %w", bitsAllocated, ErrorUnsupportedBitsAllocated)
+					}
+				}
+				currentFrame.NativeData.Data[pixel] = buf[pixel*samplesPerPixel : (pixel+1)*samplesPerPixel]
+			}
 		}
 		image.Frames[frameIdx] = currentFrame
 		if fc != nil {
@@ -368,7 +436,7 @@ func readBytes(r dicomio.Reader, t tag.Tag, vr string, vl uint32) (Value, error)
 		if vl%2 != 0 {
 			return nil, ErrorOWRequiresEvenVL
 		}
-		
+
 		buf := bytes.NewBuffer(make([]byte, 0, vl))
 		numWords := int(vl / 2)
 		for i := 0; i < numWords; i++ {
@@ -510,6 +578,7 @@ func readElement(r dicomio.Reader, d *Dataset, fc chan<- *frame.Frame) (*Element
 	if err != nil {
 		return nil, err
 	}
+	debug.Logf("readElement: tag: %s", t.String())
 
 	readImplicit := r.IsImplicit()
 	if *t == tag.Item {
@@ -521,13 +590,13 @@ func readElement(r dicomio.Reader, d *Dataset, fc chan<- *frame.Frame) (*Element
 	if err != nil {
 		return nil, err
 	}
+	debug.Logf("readElement: vr: %s", vr)
 
 	vl, err := readVL(r, readImplicit, *t, vr)
 	if err != nil {
 		return nil, err
 	}
-
-	// log.Println("readElement: vr, vl", vr, vl)
+	debug.Logf("readElement: vl: %d", vl)
 
 	val, err := readValue(r, *t, vr, vl, readImplicit, d, fc)
 	if err != nil {
